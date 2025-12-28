@@ -492,6 +492,37 @@ async function run() {
             }
         });
 
+        app.patch("/admin/users/:id/role", verifyJWT, verifyAdmin, async (req, res) => {
+            try {
+                const { id } = req.params;
+                if (!ObjectId.isValid(id)) {
+                    return res.status(400).send({ message: "Invalid user id." });
+                }
+
+                const roleMap = {
+                    student: "Student",
+                    cr: "CR",
+                    moderator: "Moderator",
+                    admin: "Admin"
+                };
+                const requestedRole = String(req.body?.role || "").trim().toLowerCase();
+                const nextRole = roleMap[requestedRole];
+                if (!nextRole) {
+                    return res.status(400).send({ message: "Invalid role." });
+                }
+
+                const result = await usersCollection.updateOne(
+                    { _id: new ObjectId(id) },
+                    { $set: { role: nextRole } }
+                );
+
+                res.send(result);
+            } catch (error) {
+                console.error("Failed to update user role", error);
+                res.status(500).send({ message: "Failed to update user role." });
+            }
+        });
+
         app.get("/admin/approvals", verifyJWT, verifyStaff, async (req, res) => {
             try {
                 const status = String(req.query.status || "Pending");
