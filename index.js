@@ -156,6 +156,47 @@ async function run() {
             }
         });
 
+        app.get("/users/section-cr", verifyJWT, async (req, res) => {
+            try {
+                const email = req.decoded?.email;
+                if (!email) {
+                    return res.status(401).send({ message: "Unauthorized access" });
+                }
+
+                const user = await usersCollection.findOne(
+                    { email: email.toLowerCase() },
+                    { projection: { batch: 1, section: 1 } }
+                );
+                if (!user) {
+                    return res.status(404).send({ message: "User not found." });
+                }
+
+                if (!user.batch || !user.section) {
+                    return res.status(400).send({ message: "Batch and section are required." });
+                }
+
+                const cr = await usersCollection.findOne(
+                    {
+                        batch: user.batch,
+                        section: user.section,
+                        role: { $regex: /^cr$/i },
+                        status: { $regex: /^approved$/i }
+                    },
+                    { projection: { name: 1, email: 1 } }
+                );
+
+                res.send({
+                    name: cr?.name || "",
+                    email: cr?.email || "",
+                    batch: user.batch,
+                    section: user.section
+                });
+            } catch (error) {
+                console.error("Failed to fetch section CR", error);
+                res.status(500).send({ message: "Failed to fetch section CR." });
+            }
+        });
+
         app.patch("/users/profile/image", verifyJWT, async (req, res) => {
             try {
                 const email = req.decoded?.email;
@@ -356,6 +397,95 @@ async function run() {
             } catch (error) {
                 console.error("Failed to create question", error);
                 res.status(500).send({ message: "Failed to create question." });
+            }
+        });
+
+        app.get("/questions", verifyJWT, async (req, res) => {
+            try {
+                const statusMap = {
+                    pending: "Pending",
+                    approved: "Approved",
+                    rejected: "Rejected"
+                };
+                const statusQuery = String(req.query.status || "Approved").trim().toLowerCase();
+                const status = statusMap[statusQuery] || "Approved";
+
+                const questions = await questionsCollection.aggregate([
+                    { $match: { status } },
+                    {
+                        $lookup: {
+                            from: "users",
+                            localField: "uploaderEmail",
+                            foreignField: "email",
+                            as: "uploader"
+                        }
+                    },
+                    { $addFields: { uploader: { $arrayElemAt: ["$uploader", 0] } } },
+                    {
+                        $project: {
+                            _id: 1,
+                            subjectName: 1,
+                            batch: 1,
+                            uploaderName: { $ifNull: ["$uploader.name", "$uploaderName"] },
+                            uploaderBatch: "$uploader.batch",
+                            uploaderRole: "$uploader.role",
+                            uploaderScore: "$uploader.contributionScore",
+                            uploaderImage: "$uploader.imageUrl",
+                            createdAt: 1
+                        }
+                    },
+                    { $sort: { createdAt: -1 } }
+                ]).toArray();
+
+                res.send(questions);
+            } catch (error) {
+                console.error("Failed to fetch questions", error);
+                res.status(500).send({ message: "Failed to fetch questions." });
+            }
+        });
+
+        app.get("/questions/:id", verifyJWT, async (req, res) => {
+            try {
+                const { id } = req.params;
+                if (!ObjectId.isValid(id)) {
+                    return res.status(400).send({ message: "Invalid question id." });
+                }
+
+                const question = await questionsCollection.findOne({ _id: new ObjectId(id) });
+                if (!question) {
+                    return res.status(404).send({ message: "Question not found." });
+                }
+
+                if (String(question.status || "").toLowerCase() !== "approved") {
+                    return res.status(403).send({ message: "Only approved questions are accessible." });
+                }
+
+                const uploader = await usersCollection.findOne(
+                    { email: question.uploaderEmail },
+                    { projection: { name: 1, batch: 1, section: 1, role: 1, contributionScore: 1, imageUrl: 1 } }
+                );
+
+                res.send({
+                    _id: question._id,
+                    subjectName: question.subjectName || "",
+                    courseCode: question.courseCode || "",
+                    batch: question.batch || "",
+                    semester: question.semester || "",
+                    type: question.type || "",
+                    section: question.section || "",
+                    facultyName: question.facultyName || "",
+                    questionImageUrl: question.questionImageUrl || "",
+                    uploaderComment: question.uploaderComment || "",
+                    uploaderName: uploader?.name || question.uploaderName || "",
+                    uploaderBatch: uploader?.batch || "",
+                    uploaderSection: uploader?.section || "",
+                    uploaderRole: uploader?.role || "Student",
+                    uploaderScore: uploader?.contributionScore ?? 0,
+                    uploaderImage: uploader?.imageUrl || ""
+                });
+            } catch (error) {
+                console.error("Failed to fetch question details", error);
+                res.status(500).send({ message: "Failed to fetch question details." });
             }
         });
 
