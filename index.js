@@ -496,7 +496,10 @@ async function run() {
                 const filters = { status };
                 if (role === "cr" || role === "moderator") {
                     filters.batch = req.staffUser?.batch;
-                    filters.section = req.staffUser?.section;
+                    filters.$or = [
+                        { type: { $regex: /^final$/i } },
+                        { section: req.staffUser?.section }
+                    ];
                 }
 
                 const questions = await questionsCollection
@@ -524,9 +527,14 @@ async function run() {
                 }
 
                 const role = String(req.staffUser?.role || "").toLowerCase();
-                if ((role === "cr" || role === "moderator") &&
-                    (question.batch !== req.staffUser?.batch || question.section !== req.staffUser?.section)) {
-                    return res.status(403).send({ message: "Forbidden access" });
+                const isFinal = String(question.type || "").toLowerCase() === "final";
+                if (role === "cr" || role === "moderator") {
+                    if (question.batch !== req.staffUser?.batch) {
+                        return res.status(403).send({ message: "Forbidden access" });
+                    }
+                    if (!isFinal && question.section !== req.staffUser?.section) {
+                        return res.status(403).send({ message: "Forbidden access" });
+                    }
                 }
 
                 const uploader = await usersCollection.findOne(
@@ -570,9 +578,14 @@ async function run() {
                 }
 
                 const role = String(req.staffUser?.role || "").toLowerCase();
-                if ((role === "cr" || role === "moderator") &&
-                    (question.batch !== req.staffUser?.batch || question.section !== req.staffUser?.section)) {
-                    return res.status(403).send({ message: "Forbidden access" });
+                const isFinal = String(question.type || "").toLowerCase() === "final";
+                if (role === "cr" || role === "moderator") {
+                    if (question.batch !== req.staffUser?.batch) {
+                        return res.status(403).send({ message: "Forbidden access" });
+                    }
+                    if (!isFinal && question.section !== req.staffUser?.section) {
+                        return res.status(403).send({ message: "Forbidden access" });
+                    }
                 }
 
                 const nextStatus = normalizedAction === "approve" ? "Approved" : "Rejected";
@@ -582,6 +595,14 @@ async function run() {
                     { _id: new ObjectId(id) },
                     { $set: { status: nextStatus, approvedBy } }
                 );
+
+                if (normalizedAction === "approve" && question.uploaderEmail) {
+                    const scoreDelta = isFinal ? 3 : 2;
+                    await usersCollection.updateOne(
+                        { email: question.uploaderEmail },
+                        { $inc: { contributionScore: scoreDelta } }
+                    );
+                }
 
                 res.send(result);
             } catch (error) {
