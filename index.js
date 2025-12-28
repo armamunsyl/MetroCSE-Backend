@@ -107,7 +107,7 @@ async function run() {
 
                 const staffUser = await usersCollection.findOne(
                     { email: email.toLowerCase() },
-                    { projection: { role: 1, batch: 1, section: 1 } }
+                    { projection: { role: 1, batch: 1, section: 1, name: 1 } }
                 );
                 const role = String(staffUser?.role || "").toLowerCase();
                 const allowedRoles = ["admin", "moderator", "cr"];
@@ -387,6 +387,7 @@ async function run() {
                     uploaderEmail: user.email,
                     approvedBy: "none",
                     status: "Pending",
+                    feedback: [],
                     isReported: false,
                     isEdited: false,
                     createdAt: new Date()
@@ -426,6 +427,8 @@ async function run() {
                             _id: 1,
                             subjectName: 1,
                             batch: 1,
+                            section: 1,
+                            type: 1,
                             uploaderName: { $ifNull: ["$uploader.name", "$uploaderName"] },
                             uploaderBatch: "$uploader.batch",
                             uploaderRole: "$uploader.role",
@@ -563,7 +566,7 @@ async function run() {
                     return res.status(400).send({ message: "Invalid question id." });
                 }
 
-                const { action } = req.body;
+                const { action, feedback } = req.body;
                 const normalizedAction = String(action || "").toLowerCase();
                 if (!["approve", "reject"].includes(normalizedAction)) {
                     return res.status(400).send({ message: "Invalid action." });
@@ -591,9 +594,23 @@ async function run() {
                 const nextStatus = normalizedAction === "approve" ? "Approved" : "Rejected";
                 const approvedBy = req.decoded?.email?.toLowerCase() || "system";
 
+                const updateDoc = { $set: { status: nextStatus, approvedBy } };
+                const feedbackText = String(feedback || "").trim();
+                if (feedbackText) {
+                    updateDoc.$push = {
+                        feedback: {
+                            message: feedbackText,
+                            byEmail: req.decoded?.email?.toLowerCase() || "system",
+                            byName: req.staffUser?.name || "",
+                            role: req.staffUser?.role || "",
+                            createdAt: new Date()
+                        }
+                    };
+                }
+
                 const result = await questionsCollection.updateOne(
                     { _id: new ObjectId(id) },
-                    { $set: { status: nextStatus, approvedBy } }
+                    updateDoc
                 );
 
                 if (normalizedAction === "approve" && question.uploaderEmail) {
@@ -603,6 +620,154 @@ async function run() {
                         { $inc: { contributionScore: scoreDelta } }
                     );
                 }
+
+                res.send(result);
+            } catch (error) {
+                console.error("Failed to update contribution", error);
+                res.status(500).send({ message: "Failed to update contribution." });
+            }
+        });
+
+        app.get("/users/contributions", verifyJWT, async (req, res) => {
+            try {
+                const email = req.decoded?.email;
+                if (!email) {
+                    return res.status(401).send({ message: "Unauthorized access" });
+                }
+
+                const status = String(req.query.status || "").trim();
+                const filters = { uploaderEmail: email.toLowerCase() };
+                if (status) {
+                    filters.status = status;
+                }
+
+                const contributions = await questionsCollection
+                    .find(filters)
+                    .project({
+                        subjectName: 1,
+                        courseCode: 1,
+                        batch: 1,
+                        semester: 1,
+                        type: 1,
+                        section: 1,
+                        facultyName: 1,
+                        status: 1,
+                        uploaderComment: 1,
+                        questionImageUrl: 1,
+                        createdAt: 1
+                    })
+                    .sort({ createdAt: -1 })
+                    .toArray();
+
+                res.send(contributions);
+            } catch (error) {
+                console.error("Failed to fetch user contributions", error);
+                res.status(500).send({ message: "Failed to fetch user contributions." });
+            }
+        });
+
+        app.get("/users/contributions/:id", verifyJWT, async (req, res) => {
+            try {
+                const { id } = req.params;
+                if (!ObjectId.isValid(id)) {
+                    return res.status(400).send({ message: "Invalid question id." });
+                }
+
+                const email = req.decoded?.email;
+                if (!email) {
+                    return res.status(401).send({ message: "Unauthorized access" });
+                }
+
+                const question = await questionsCollection.findOne({ _id: new ObjectId(id) });
+                if (!question) {
+                    return res.status(404).send({ message: "Question not found." });
+                }
+
+                if (String(question.uploaderEmail || "").toLowerCase() !== email.toLowerCase()) {
+                    return res.status(403).send({ message: "Forbidden access" });
+                }
+
+                res.send({
+                    _id: question._id,
+                    subjectName: question.subjectName || "",
+                    courseCode: question.courseCode || "",
+                    batch: question.batch || "",
+                    semester: question.semester || "",
+                    type: question.type || "",
+                    section: question.section || "",
+                    facultyName: question.facultyName || "",
+                    questionImageUrl: question.questionImageUrl || "",
+                    uploaderComment: question.uploaderComment || "",
+                    status: question.status || "",
+                    feedback: question.feedback || []
+                });
+            } catch (error) {
+                console.error("Failed to fetch contribution details", error);
+                res.status(500).send({ message: "Failed to fetch contribution details." });
+            }
+        });
+
+        app.patch("/users/contributions/:id", verifyJWT, async (req, res) => {
+            try {
+                const { id } = req.params;
+                if (!ObjectId.isValid(id)) {
+                    return res.status(400).send({ message: "Invalid question id." });
+                }
+
+                const email = req.decoded?.email;
+                if (!email) {
+                    return res.status(401).send({ message: "Unauthorized access" });
+                }
+
+                const question = await questionsCollection.findOne({ _id: new ObjectId(id) });
+                if (!question) {
+                    return res.status(404).send({ message: "Question not found." });
+                }
+
+                if (String(question.uploaderEmail || "").toLowerCase() !== email.toLowerCase()) {
+                    return res.status(403).send({ message: "Forbidden access" });
+                }
+
+                const currentStatus = String(question.status || "").toLowerCase();
+                if (!["pending", "rejected"].includes(currentStatus)) {
+                    return res.status(400).send({ message: "Only pending or rejected questions can be edited." });
+                }
+
+                const {
+                    subjectName,
+                    courseCode,
+                    batch,
+                    semester,
+                    type,
+                    section,
+                    facultyName,
+                    questionImageUrl,
+                    uploaderComment,
+                    status
+                } = req.body;
+
+                const updateFields = {
+                    subjectName: subjectName ?? question.subjectName,
+                    courseCode: courseCode ?? question.courseCode,
+                    batch: batch ?? question.batch,
+                    semester: semester ?? question.semester,
+                    type: type ?? question.type,
+                    section: section ?? question.section,
+                    facultyName: facultyName ?? question.facultyName,
+                    questionImageUrl: questionImageUrl ?? question.questionImageUrl,
+                    uploaderComment: uploaderComment ?? question.uploaderComment,
+                    isEdited: true
+                };
+
+                if (String(question.status || "").toLowerCase() === "rejected" &&
+                    String(status || "").toLowerCase() === "pending") {
+                    updateFields.status = "Pending";
+                }
+
+                const result = await questionsCollection.updateOne(
+                    { _id: new ObjectId(id) },
+                    { $set: updateFields }
+                );
 
                 res.send(result);
             } catch (error) {
