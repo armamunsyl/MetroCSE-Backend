@@ -82,6 +82,59 @@ async function run() {
         const noticeCommentsCollection = db.collection("notice_comments");
         const feedbackCollection = db.collection("admin_feedback");
         const reportsCollection = db.collection("reports");
+        const notificationsCollection = db.collection("notifications");
+
+        const notificationTypes = [
+            "contribution_request",
+            "notice_request",
+            "notice_published",
+            "question_published",
+            "report_created",
+            "question_comment",
+            "member_approval"
+        ];
+
+        const buildNotificationMatch = (user) => {
+            const email = String(user?.email || "").toLowerCase();
+            const role = String(user?.role || "").toLowerCase();
+            const batch = String(user?.batch || "").trim();
+            const section = String(user?.section || "").trim();
+            return {
+                $or: [
+                    { audienceType: "all" },
+                    { audienceType: "role", audienceRoles: { $in: [role] } },
+                    { audienceType: "user", audienceEmail: email },
+                    { audienceType: "batch", audienceBatch: batch },
+                    { audienceType: "batch-section", audienceBatch: batch, audienceSection: section }
+                ]
+            };
+        };
+
+        const createNotification = async ({
+            type,
+            title,
+            message,
+            audienceType = "all",
+            audienceRoles = [],
+            audienceEmail = "",
+            audienceBatch = "",
+            audienceSection = "",
+            metadata = {}
+        }) => {
+            const doc = {
+                type: String(type || "").trim(),
+                title: String(title || "").trim(),
+                message: String(message || "").trim(),
+                audienceType,
+                audienceRoles,
+                audienceEmail,
+                audienceBatch,
+                audienceSection,
+                metadata,
+                createdAt: new Date()
+            };
+            await notificationsCollection.insertOne(doc);
+        };
 
         const verifyAdmin = async (req, res, next) => {
             try {
@@ -367,6 +420,18 @@ async function run() {
                 };
 
                 const result = await usersCollection.insertOne(user);
+                await createNotification({
+                    type: "member_approval",
+                    title: "New member approval",
+                    message: `New member request: ${name} (CSE ${batch}${section ? ` Sec ${section}` : ""}).`,
+                    audienceType: "role",
+                    audienceRoles: ["admin", "moderator", "cr"],
+                    metadata: {
+                        userEmail: normalizedEmail,
+                        batch,
+                        section
+                    }
+                });
                 res.send(result);
             } catch (error) {
                 console.error("Failed to create user", error);
@@ -439,6 +504,19 @@ async function run() {
                 };
 
                 const result = await questionsCollection.insertOne(questionDoc);
+                await createNotification({
+                    type: "contribution_request",
+                    title: "New contribution request",
+                    message: `New contribution submitted: ${subjectName} (${courseCode}).`,
+                    audienceType: "role",
+                    audienceRoles: ["admin", "moderator", "cr"],
+                    metadata: {
+                        questionId: result.insertedId,
+                        batch,
+                        section,
+                        type: normalizedType
+                    }
+                });
                 res.send(result);
             } catch (error) {
                 console.error("Failed to create question", error);
@@ -615,6 +693,307 @@ async function run() {
             } catch (error) {
                 console.error("Failed to fetch banners", error);
                 res.status(500).send({ message: "Failed to fetch banners." });
+            }
+        });
+
+        app.get("/notifications/summary", verifyJWT, async (req, res) => {
+            try {
+                const email = String(req.decoded?.email || "").toLowerCase();
+                if (!email) {
+                    return res.status(401).send({ message: "Unauthorized access" });
+                }
+
+                const user = await usersCollection.findOne({ email });
+                if (!user) {
+                    return res.status(404).send({ message: "User not found." });
+                }
+
+                const readAt = user.notificationsReadAt ? new Date(user.notificationsReadAt) : new Date(0);
+                const readAtByType = user.notificationsReadAtByType || {};
+                const match = buildNotificationMatch(user);
+
+                const counts = await Promise.all(
+                    notificationTypes.map(async (type) => {
+                        const typeReadAt = readAtByType[type] ? new Date(readAtByType[type]) : readAt;
+                        const count = await notificationsCollection.countDocuments({
+                            ...match,
+                            type,
+                            createdAt: { $gt: typeReadAt }
+                        });
+                        return { type, count };
+                    })
+                );
+
+                const typeCounts = counts.reduce((acc, item) => {
+                    acc[item.type] = item.count;
+                    return acc;
+                }, {});
+
+                const unreadCount = counts.reduce((total, item) => total + item.count, 0);
+
+                res.send({ unreadCount, readAt, unreadByType: typeCounts });
+            } catch (error) {
+                console.error("Failed to fetch notification summary", error);
+                res.status(500).send({ message: "Failed to fetch notifications." });
+            }
+        });
+
+        app.get("/notifications", verifyJWT, async (req, res) => {
+            try {
+                const email = String(req.decoded?.email || "").toLowerCase();
+                if (!email) {
+                    return res.status(401).send({ message: "Unauthorized access" });
+                }
+
+                const user = await usersCollection.findOne({ email });
+                if (!user) {
+                    return res.status(404).send({ message: "User not found." });
+                }
+
+                const readAt = user.notificationsReadAt ? new Date(user.notificationsReadAt) : new Date(0);
+                const readAtByType = user.notificationsReadAtByType || {};
+                const typeParam = String(req.query.type || "").trim();
+                const unreadOnly = String(req.query.unreadOnly || "").toLowerCase() === "true";
+                const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || "5", 10)));
+                const page = Math.max(1, parseInt(req.query.page || "1", 10));
+                const skip = (page - 1) * limit;
+
+                const match = buildNotificationMatch(user);
+                if (typeParam) {
+                    match.type = { $in: typeParam.split(",").map((item) => item.trim()).filter(Boolean) };
+                }
+                if (unreadOnly) {
+                    const typesToFilter = match.type?.$in?.length ? match.type.$in : notificationTypes;
+                    const minReadAt = typesToFilter.reduce((minValue, type) => {
+                        const typeReadAt = readAtByType[type] ? new Date(readAtByType[type]) : readAt;
+                        return typeReadAt < minValue ? typeReadAt : minValue;
+                    }, readAt);
+                    match.createdAt = { $gt: minReadAt };
+                }
+
+                const [items, total] = await Promise.all([
+                    notificationsCollection
+                        .find(match)
+                        .sort({ createdAt: -1 })
+                        .skip(skip)
+                        .limit(limit)
+                        .toArray(),
+                    notificationsCollection.countDocuments(match)
+                ]);
+
+                const counts = await Promise.all(
+                    notificationTypes.map(async (type) => {
+                        const typeReadAt = readAtByType[type] ? new Date(readAtByType[type]) : readAt;
+                        const count = await notificationsCollection.countDocuments({
+                            ...buildNotificationMatch(user),
+                            type,
+                            createdAt: { $gt: typeReadAt }
+                        });
+                        return count;
+                    })
+                );
+                const unreadCount = counts.reduce((total, count) => total + count, 0);
+
+                const normalizedItems = items.map((item) => ({
+                    id: String(item._id),
+                    type: item.type || "",
+                    title: item.title || "",
+                    message: item.message || "",
+                    metadata: item.metadata
+                        ? {
+                            ...item.metadata,
+                            questionId: item.metadata.questionId ? String(item.metadata.questionId) : undefined
+                        }
+                        : {},
+                    createdAt: item.createdAt,
+                    isRead: item.createdAt <= (readAtByType[item.type] ? new Date(readAtByType[item.type]) : readAt)
+                }));
+
+                res.send({
+                    items: normalizedItems,
+                    unreadCount,
+                    readAt,
+                    page,
+                    total,
+                    totalPages: Math.max(1, Math.ceil(total / limit))
+                });
+            } catch (error) {
+                console.error("Failed to fetch notifications", error);
+                res.status(500).send({ message: "Failed to fetch notifications." });
+            }
+        });
+
+        app.patch("/notifications/read", verifyJWT, async (req, res) => {
+            try {
+                const email = String(req.decoded?.email || "").toLowerCase();
+                if (!email) {
+                    return res.status(401).send({ message: "Unauthorized access" });
+                }
+
+                const readAt = new Date();
+                await usersCollection.updateOne(
+                    { email },
+                    { $set: { notificationsReadAt: readAt } }
+                );
+
+                res.send({ readAt });
+            } catch (error) {
+                console.error("Failed to mark notifications read", error);
+                res.status(500).send({ message: "Failed to update notifications." });
+            }
+        });
+
+        app.patch("/notifications/read-type", verifyJWT, async (req, res) => {
+            try {
+                const email = String(req.decoded?.email || "").toLowerCase();
+                if (!email) {
+                    return res.status(401).send({ message: "Unauthorized access" });
+                }
+
+                const types = Array.isArray(req.body?.types)
+                    ? req.body.types.map((type) => String(type || "").trim()).filter(Boolean)
+                    : [];
+                if (!types.length) {
+                    return res.status(400).send({ message: "Notification types are required." });
+                }
+
+                const now = new Date();
+                const updateDoc = types.reduce((acc, type) => {
+                    acc[`notificationsReadAtByType.${type}`] = now;
+                    return acc;
+                }, {});
+
+                await usersCollection.updateOne({ email }, { $set: updateDoc });
+                res.send({ readAt: now, types });
+            } catch (error) {
+                console.error("Failed to mark notifications read by type", error);
+                res.status(500).send({ message: "Failed to update notifications." });
+            }
+        });
+
+        app.get("/dashboard/overview", verifyJWT, async (req, res) => {
+            try {
+                const email = String(req.decoded?.email || "").toLowerCase();
+                if (!email) {
+                    return res.status(401).send({ message: "Unauthorized access" });
+                }
+
+                const user = await usersCollection.findOne(
+                    { email },
+                    { projection: { role: 1, batch: 1, section: 1 } }
+                );
+
+                const role = String(user?.role || "").toLowerCase();
+                const pendingStatus = { $regex: /^pending$/i };
+                const approvedStatus = { $regex: /^approved$/i };
+                const isStaff = ["admin", "moderator", "cr"].includes(role);
+
+                let pendingFilters = { status: pendingStatus };
+                if (!isStaff) {
+                    pendingFilters = { status: pendingStatus, uploaderEmail: email };
+                } else if (role === "cr" || role === "moderator") {
+                    pendingFilters.batch = user?.batch || "";
+                    pendingFilters.$or = [
+                        { type: { $regex: /^final$/i } },
+                        { section: user?.section || "" }
+                    ];
+                }
+
+                const sinceDate = new Date();
+                sinceDate.setDate(sinceDate.getDate() - 30);
+
+                const [
+                    totalContributions,
+                    pendingRequests,
+                    newNotices,
+                    recentContributions,
+                    recentNotices
+                ] = await Promise.all([
+                    questionsCollection.countDocuments({ uploaderEmail: email }),
+                    questionsCollection.countDocuments(pendingFilters),
+                    noticesCollection.countDocuments({ status: approvedStatus, createdAt: { $gte: sinceDate } }),
+                    questionsCollection
+                        .find({ uploaderEmail: email })
+                        .project({ subjectName: 1, courseCode: 1, createdAt: 1 })
+                        .sort({ createdAt: -1 })
+                        .limit(3)
+                        .toArray(),
+                    noticesCollection
+                        .find({ status: approvedStatus })
+                        .project({ title: 1, createdAt: 1 })
+                        .sort({ createdAt: -1 })
+                        .limit(3)
+                        .toArray()
+                ]);
+
+                const activityItems = []
+                recentContributions.forEach((item) => {
+                    const label = item.subjectName || item.courseCode || "a course";
+                    activityItems.push({
+                        createdAt: item.createdAt || new Date(0),
+                        message: `Contribution submitted for ${label}.`
+                    });
+                });
+                recentNotices.forEach((item) => {
+                    const label = item.title || "new notice";
+                    activityItems.push({
+                        createdAt: item.createdAt || new Date(0),
+                        message: `Notice posted: ${label}.`
+                    });
+                });
+
+                activityItems.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+                const recentActivity = activityItems.slice(0, 3).map((item) => item.message);
+
+                res.send({
+                    stats: {
+                        totalContributions,
+                        pendingRequests,
+                        newNotices
+                    },
+                    recentActivity
+                });
+            } catch (error) {
+                console.error("Failed to fetch dashboard overview", error);
+                res.status(500).send({ message: "Failed to fetch dashboard overview." });
+            }
+        });
+
+        app.get("/stats", async (req, res) => {
+            try {
+                const approvedFilter = { status: { $regex: /^approved$/i } };
+                const [statsDoc] = await questionsCollection
+                    .aggregate([
+                        { $match: approvedFilter },
+                        {
+                            $group: {
+                                _id: null,
+                                totalQuestions: { $sum: 1 },
+                                batches: { $addToSet: "$batch" },
+                                contributors: { $addToSet: "$uploaderEmail" }
+                            }
+                        }
+                    ])
+                    .toArray();
+
+                const normalizeBatch = (value) =>
+                    String(value || "")
+                        .trim()
+                        .replace(/^cse\s*/i, "")
+                        .trim();
+
+                const rawBatches = Array.isArray(statsDoc?.batches) ? statsDoc.batches : [];
+                const rawContributors = Array.isArray(statsDoc?.contributors) ? statsDoc.contributors : [];
+                const totalQuestions = statsDoc?.totalQuestions || 0;
+                const totalBatches = new Set(rawBatches.map(normalizeBatch).filter(Boolean)).size;
+                const totalContributors = new Set(
+                    rawContributors.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean)
+                ).size;
+
+                res.send({ totalQuestions, totalBatches, totalContributors });
+            } catch (error) {
+                console.error("Failed to fetch stats", error);
+                res.status(500).send({ message: "Failed to fetch stats." });
             }
         });
 
@@ -797,6 +1176,14 @@ async function run() {
                 };
 
                 const result = await noticesCollection.insertOne(noticeDoc);
+                await createNotification({
+                    type: "notice_request",
+                    title: "Notice approval request",
+                    message: `New notice submitted: ${normalizedTitle}.`,
+                    audienceType: "role",
+                    audienceRoles: ["admin"],
+                    metadata: { noticeId: result.insertedId }
+                });
                 res.send({ ...noticeDoc, _id: result.insertedId });
             } catch (error) {
                 console.error("Failed to create notice", error);
@@ -995,6 +1382,115 @@ async function run() {
             }
         });
 
+        app.get("/admin/analytics", verifyJWT, verifyAdmin, async (req, res) => {
+            try {
+                const approvedStatus = { $regex: /^approved$/i };
+                const normalizeBatch = (value) =>
+                    String(value || "")
+                        .trim()
+                        .replace(/^cse\s*/i, "")
+                        .trim();
+                const normalizeSection = (value) =>
+                    String(value || "")
+                        .trim()
+                        .replace(/^sec\s*/i, "")
+                        .trim()
+                        .toUpperCase();
+
+                const [
+                    rawUsersByBatch,
+                    rawUsersBySection,
+                    rawUsersByBatchSection,
+                    rawQuestionsByBatch,
+                    rawQuestionsBySection,
+                    rawQuestionsByBatchSection,
+                    rawUserGraph
+                ] = await Promise.all([
+                    usersCollection.aggregate([
+                        { $group: { _id: "$batch", count: { $sum: 1 } } }
+                    ]).toArray(),
+                    usersCollection.aggregate([
+                        { $group: { _id: "$section", count: { $sum: 1 } } }
+                    ]).toArray(),
+                    usersCollection.aggregate([
+                        { $group: { _id: { batch: "$batch", section: "$section" }, count: { $sum: 1 } } }
+                    ]).toArray(),
+                    questionsCollection.aggregate([
+                        { $match: { status: approvedStatus } },
+                        { $group: { _id: "$batch", count: { $sum: 1 } } }
+                    ]).toArray(),
+                    questionsCollection.aggregate([
+                        { $match: { status: approvedStatus } },
+                        { $group: { _id: "$section", count: { $sum: 1 } } }
+                    ]).toArray(),
+                    questionsCollection.aggregate([
+                        { $match: { status: approvedStatus } },
+                        { $group: { _id: { batch: "$batch", section: "$section" }, count: { $sum: 1 } } }
+                    ]).toArray(),
+                    usersCollection.aggregate([
+                        {
+                            $group: {
+                                _id: {
+                                    $dateToString: { format: "%Y-%m", date: "$createdAt" }
+                                },
+                                count: { $sum: 1 }
+                            }
+                        },
+                        { $sort: { _id: 1 } },
+                        { $limit: 12 }
+                    ]).toArray()
+                ]);
+
+                const mergeCounts = (items, keyBuilder) => {
+                    const map = new Map();
+                    items.forEach((item) => {
+                        const key = keyBuilder(item);
+                        if (!key) return;
+                        map.set(key, (map.get(key) || 0) + (item.count || 0));
+                    });
+                    return Array.from(map.entries())
+                        .map(([key, count]) => ({ key, count }))
+                        .sort((a, b) => b.count - a.count);
+                };
+
+                const usersByBatch = mergeCounts(rawUsersByBatch, (item) => normalizeBatch(item._id));
+                const usersBySection = mergeCounts(rawUsersBySection, (item) => normalizeSection(item._id));
+                const usersByBatchSection = mergeCounts(rawUsersByBatchSection, (item) => {
+                    const batch = normalizeBatch(item?._id?.batch);
+                    const section = normalizeSection(item?._id?.section);
+                    if (!batch || !section) return "";
+                    return `${batch}-${section}`;
+                });
+
+                const questionsByBatch = mergeCounts(rawQuestionsByBatch, (item) => normalizeBatch(item._id));
+                const questionsBySection = mergeCounts(rawQuestionsBySection, (item) => normalizeSection(item._id));
+                const questionsByBatchSection = mergeCounts(rawQuestionsByBatchSection, (item) => {
+                    const batch = normalizeBatch(item?._id?.batch);
+                    const section = normalizeSection(item?._id?.section);
+                    if (!batch || !section) return "";
+                    return `${batch}-${section}`;
+                });
+
+                const userGraph = rawUserGraph.map((item) => ({
+                    label: item._id,
+                    count: item.count || 0
+                }));
+
+                res.send({
+                    usersByBatch,
+                    usersBySection,
+                    usersByBatchSection,
+                    questionsByBatch,
+                    questionsBySection,
+                    questionsByBatchSection,
+                    userGraph
+                });
+            } catch (error) {
+                console.error("Failed to fetch analytics", error);
+                res.status(500).send({ message: "Failed to fetch analytics." });
+            }
+        });
+
         app.patch("/admin/notices/:id", verifyJWT, verifyAdmin, async (req, res) => {
             try {
                 const { id } = req.params;
@@ -1023,6 +1519,16 @@ async function run() {
                     { _id: new ObjectId(id) },
                     { $set: { status: nextStatus, approvedBy, updatedAt: new Date() } }
                 );
+
+                if (nextStatus === "Approved") {
+                    await createNotification({
+                        type: "notice_published",
+                        title: "New notice published",
+                        message: `Notice published: ${notice.title || "New notice"}.`,
+                        audienceType: "all",
+                        metadata: { noticeId: notice._id }
+                    });
+                }
 
                 res.send(result);
             } catch (error) {
@@ -1173,6 +1679,17 @@ async function run() {
                 };
 
                 const result = await reportsCollection.insertOne(reportDoc);
+                await createNotification({
+                    type: "report_created",
+                    title: "New report submitted",
+                    message: `A new ${normalizedType} report was submitted.`,
+                    audienceType: "role",
+                    audienceRoles: ["admin"],
+                    metadata: {
+                        reportId: result.insertedId,
+                        targetType: normalizedType
+                    }
+                });
                 res.send({ ...reportDoc, _id: result.insertedId });
             } catch (error) {
                 console.error("Failed to create report", error);
@@ -1397,6 +1914,11 @@ async function run() {
                     { projection: { name: 1, imageUrl: 1, batch: 1, section: 1, contributionScore: 1, role: 1 } }
                 );
 
+                const question = await questionsCollection.findOne(
+                    { _id: new ObjectId(questionId) },
+                    { projection: { uploaderEmail: 1, subjectName: 1, courseCode: 1 } }
+                );
+
                 const commentDoc = {
                     questionId: new ObjectId(questionId),
                     message: text,
@@ -1412,6 +1934,16 @@ async function run() {
                 };
 
                 const result = await commentsCollection.insertOne(commentDoc);
+                if (question?.uploaderEmail && question.uploaderEmail !== email.toLowerCase()) {
+                    await createNotification({
+                        type: "question_comment",
+                        title: "New comment on your question",
+                        message: `New comment on ${question.subjectName || question.courseCode || "your question"}.`,
+                        audienceType: "user",
+                        audienceEmail: question.uploaderEmail,
+                        metadata: { questionId: question._id }
+                    });
+                }
                 res.send({ ...commentDoc, _id: result.insertedId });
             } catch (error) {
                 console.error("Failed to create comment", error);
@@ -1610,6 +2142,13 @@ async function run() {
                         { email: question.uploaderEmail },
                         { $inc: { contributionScore: scoreDelta } }
                     );
+                    await createNotification({
+                        type: "question_published",
+                        title: "New question added",
+                        message: `New question added: ${question.subjectName || question.courseCode || "New question"}.`,
+                        audienceType: "all",
+                        metadata: { questionId: question._id }
+                    });
                 }
 
                 res.send(result);
