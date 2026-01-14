@@ -1558,7 +1558,7 @@ async function run() {
 
         app.post("/admin/feedback", verifyJWT, verifyAdmin, async (req, res) => {
             try {
-                const { title, message, targetEmail, batch, section } = req.body || {};
+                const { title, message, targetEmail, batch, section, targetRole } = req.body || {};
                 const normalizedTitle = String(title || "").trim();
                 const normalizedMessage = String(message || "").trim();
                 if (!normalizedTitle || !normalizedMessage) {
@@ -1574,12 +1574,20 @@ async function run() {
                 const normalizedTargetEmail = String(targetEmail || "").trim().toLowerCase();
                 const normalizedBatch = String(batch || "").trim().replace(/^cse\s*/i, "");
                 const normalizedSection = String(section || "").trim().replace(/^sec\s*/i, "");
+                const normalizedRole = String(targetRole || "").trim().toLowerCase();
 
                 let userQuery = null;
                 let targetType = "";
                 if (normalizedTargetEmail) {
                     userQuery = { email: normalizedTargetEmail };
                     targetType = "email";
+                } else if (normalizedRole) {
+                    const allowedRoles = ["cr", "moderator"];
+                    if (!allowedRoles.includes(normalizedRole)) {
+                        return res.status(400).send({ message: "Invalid role target." });
+                    }
+                    userQuery = { role: { $regex: new RegExp(`^${normalizedRole}$`, "i") } };
+                    targetType = "role";
                 } else if (normalizedBatch) {
                     userQuery = {
                         batch: {
@@ -1591,7 +1599,7 @@ async function run() {
                         userQuery.section = new RegExp(`^${normalizedSection}$`, "i");
                     }
                 } else {
-                    return res.status(400).send({ message: "Target email or batch is required." });
+                    return res.status(400).send({ message: "Target email, role, or batch is required." });
                 }
 
                 const users = await usersCollection
